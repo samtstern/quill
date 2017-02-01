@@ -3,6 +3,7 @@ package me.vickychijwani.spectre.view.fragments;
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -28,6 +29,7 @@ import com.crashlytics.android.Crashlytics;
 import com.github.slugify.Slugify;
 import com.squareup.otto.Subscribe;
 
+import java.io.File;
 import java.io.IOException;
 
 import butterknife.Bind;
@@ -46,6 +48,7 @@ import me.vickychijwani.spectre.model.entity.Post;
 import me.vickychijwani.spectre.model.entity.Tag;
 import me.vickychijwani.spectre.util.EditTextSelectionState;
 import me.vickychijwani.spectre.util.EditTextUtils;
+import me.vickychijwani.spectre.util.FileUtils;
 import me.vickychijwani.spectre.util.KeyboardUtils;
 import me.vickychijwani.spectre.util.PostUtils;
 import me.vickychijwani.spectre.view.BundleKeys;
@@ -345,6 +348,10 @@ public class PostEditFragment extends BaseFragment implements
 
         mUploadProgress = ProgressDialog.show(mActivity, null,
                 mActivity.getString(R.string.uploading), true, false);
+
+        Uri uri = result.getData();
+        File file = FileUtils.getFile(mActivity, uri);
+        String mimeType = mActivity.getContentResolver().getType(uri);
 
         mUploadSubscription = Observables
                 .getBitmapFromUri(mActivity.getContentResolver(), result.getData())

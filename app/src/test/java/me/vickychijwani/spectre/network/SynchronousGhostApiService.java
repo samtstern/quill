@@ -12,6 +12,8 @@ import retrofit.http.GET;
 import retrofit.http.Header;
 import retrofit.http.POST;
 
+import static io.fabric.sdk.android.services.network.HttpMethod.GET;
+
 // FIXME duplicate of GhostApiService, make this DRY after moving to Retrofit2 since it
 // FIXME can be used as sync/async without changing the interface
 interface SynchronousGhostApiService {
@@ -19,18 +21,18 @@ interface SynchronousGhostApiService {
     // auth
     // FIXME this is bogus: the login page is NOT under /ghost/api/v0.1, it's at the root
     // FIXME it still works because Ghost includes the client secret on the 404 page too!
-    @GET("/ghost/")
+    @GET("ghost/")
     Response getLoginPage();
 
-    @POST("/authentication/token/")
+    @POST("authentication/token/")
     AuthToken getAuthToken(@Body AuthReqBody credentials);
 
-    @POST("/authentication/revoke/")
+    @POST("authentication/revoke/")
     JsonElement revokeAuthToken(@Header("Authorization") String authHeader,
                                 @Body RevokeReqBody revoke);
 
     // users
-    @GET("/users/me/?include=roles&status=all")
+    @GET("users/me/?include=roles&status=all")
     UserList getCurrentUser(@Header("Authorization") String authHeader,
                             @Header("If-None-Match") String etag);
 

@@ -6,10 +6,8 @@ import android.support.annotation.Nullable;
 import android.util.Log;
 
 import com.crashlytics.android.Crashlytics;
-import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.squareup.okhttp.OkHttpClient;
 import com.squareup.otto.Bus;
 import com.squareup.otto.Subscribe;
 
@@ -32,7 +30,6 @@ import io.realm.RealmObject;
 import io.realm.RealmQuery;
 import io.realm.RealmResults;
 import io.realm.Sort;
-import me.vickychijwani.spectre.BuildConfig;
 import me.vickychijwani.spectre.SpectreApplication;
 import me.vickychijwani.spectre.analytics.AnalyticsService;
 import me.vickychijwani.spectre.error.ExpiredTokenUsedException;
@@ -96,15 +93,13 @@ import me.vickychijwani.spectre.pref.UserPrefs;
 import me.vickychijwani.spectre.util.DateTimeUtils;
 import me.vickychijwani.spectre.util.NetworkUtils;
 import me.vickychijwani.spectre.util.PostUtils;
-import retrofit.Callback;
-import retrofit.ResponseCallback;
-import retrofit.RestAdapter;
-import retrofit.RetrofitError;
-import retrofit.client.Header;
-import retrofit.client.OkClient;
-import retrofit.client.Response;
-import retrofit.converter.GsonConverter;
-import retrofit.mime.TypedFile;
+import okhttp3.Headers;
+import okhttp3.OkHttpClient;
+import retrofit2.Call;
+import retrofit2.Callback;
+import retrofit2.Response;
+import retrofit2.Retrofit;
+import retrofit2.converter.gson.GsonConverterFactory;
 import rx.Observable;
 import rx.functions.Action0;
 import rx.functions.Action1;
@@ -121,7 +116,8 @@ public class NetworkService {
     private GhostApiService mApi = null;
     private AuthToken mAuthToken = null;
     private OkHttpClient mOkHttpClient = null;
-    private final GsonConverter mGsonConverter;
+    private final JSONObjectConverterFactory mJSONObjectConverterFactory;
+    private final GsonConverterFactory mGsonConverterFactory;
 
     private boolean mbAuthRequestOnGoing = false;
     private RetrofitError mRefreshError = null;
@@ -130,8 +126,8 @@ public class NetworkService {
 
     public NetworkService() {
         Crashlytics.log(Log.DEBUG, TAG, "Initializing NetworkService...");
-        Gson gson = GhostApiUtils.getGson();
-        mGsonConverter = new GsonConverter(gson);
+        mGsonConverterFactory = GsonConverterFactory.create(GhostApiUtils.getGson());
+        mJSONObjectConverterFactory = JSONObjectConverterFactory.create();
     }
 
     public void start(Context context, OkHttpClient okHttpClient) {
@@ -165,16 +161,17 @@ public class NetworkService {
 
     private void doLogin(@NonNull LoginStartEvent event, @Nullable String clientSecret) {
         AuthReqBody credentials = new AuthReqBody(event.username, event.password, clientSecret);
-        mApi.getAuthToken(credentials, new Callback<AuthToken>() {
+        mApi.getAuthToken(credentials).enqueue(new Callback<AuthToken>() {
             @Override
-            public void success(AuthToken authToken, Response response) {
+            public void onResponse(Call<AuthToken> call, Response<AuthToken> response) {
+                AuthToken authToken = response.body();
                 onNewAuthToken(authToken);
                 getBus().post(new LoginDoneEvent(event.blogUrl, event.username, event.password,
-                        event.initiatedByUser));
+                                                 event.initiatedByUser));
             }
 
             @Override
-            public void failure(RetrofitError error) {
+            public void onFailure(Call<AuthToken> call, Throwable t) {
                 mbAuthRequestOnGoing = false;
                 // if this request was not initiated by the user and the response is 401 Unauthorized,
                 // it means the password changed - ask for the password again
@@ -269,31 +266,34 @@ public class NetworkService {
             doLoadConfiguration(new LoadConfigurationEvent(true), successCallback, failureCallback);
         };
 
-        mApi.getVersion(mAuthToken.getAuthHeader(), new JSONObjectCallback() {
+        mApi.getVersion(mAuthToken.getAuthHeader()).enqueue(new Callback<JSONObject>() {
             @Override
-            public void onSuccess(JSONObject jsonObject, Response response) {
-                try {
-                    String ghostVersion = jsonObject
-                            .getJSONArray("configuration")
-                            .getJSONObject(0)
-                            .getString("version");
-                    getBus().post(new GhostVersionLoadedEvent(ghostVersion));
-                } catch (JSONException e) {
-                    getBus().post(new GhostVersionLoadedEvent(UNKNOWN_VERSION));
+            public void onResponse(Call<JSONObject> call, Response<JSONObject> response) {
+                if (response.isSuccessful()) {
+                    JSONObject jsonObject = response.body();
+                    try {
+                        String ghostVersion = jsonObject
+                                .getJSONArray("configuration")
+                                .getJSONObject(0)
+                                .getString("version");
+                        getBus().post(new GhostVersionLoadedEvent(ghostVersion));
+                    } catch (JSONException e) {
+                        getBus().post(new GhostVersionLoadedEvent(UNKNOWN_VERSION));
+                    }
+                } else {
+                    if (response.code() == HttpURLConnection.HTTP_NOT_FOUND) {
+                        // this condition means the version is < 0.7.9, because that is when
+                        // the new /configuration/about endpoint was introduced
+                        // FIXME remove this mess once we stop supporting < 0.7.9
+                        checkVersionInConfiguration.call();
+                    } else {
+                        getBus().post(new GhostVersionLoadedEvent(UNKNOWN_VERSION));
+                    }
                 }
             }
 
             @Override
-            public void onFailure(RetrofitError error) {
-                if (error.getResponse() != null
-                        && error.getResponse().getStatus() == HttpURLConnection.HTTP_NOT_FOUND) {
-                    // this condition means the version is < 0.7.9, because that is when
-                    // the new /configuration/about endpoint was introduced
-                    // FIXME remove this mess once we stop supporting < 0.7.9
-                    checkVersionInConfiguration.call();
-                } else {
-                    getBus().post(new GhostVersionLoadedEvent(UNKNOWN_VERSION));
-                }
+            public void onFailure(Call<JSONObject> call, Throwable error) {
             }
         });
     }
@@ -310,37 +310,46 @@ public class NetworkService {
             // else no users found in db, force a network call!
         }
 
+        CHECK IF OKHTTP USES E-TAGS AUTOMATICALLY
         if (! validateAccessToken(event)) return;
-        mApi.getCurrentUser(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_CURRENT_USER), new Callback<UserList>() {
+        mApi.getCurrentUser(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_CURRENT_USER)).enqueue(new Callback<UserList>() {
             @Override
-            public void success(UserList userList, Response response) {
-                storeEtag(response.getHeaders(), ETag.TYPE_CURRENT_USER);
-                createOrUpdateModel(userList.users);
-                getBus().post(new UserLoadedEvent(userList.users.get(0)));
+            public void onResponse(Call<UserList> call, Response<UserList> response) {
+                if (response.isSuccessful()) {
+                    UserList userList = response.body();
+                    storeEtag(response.headers(), ETag.TYPE_CURRENT_USER);
+                    createOrUpdateModel(userList.users);
+                    getBus().post(new UserLoadedEvent(userList.users.get(0)));
 
-                // download all posts again to enforce role-based permissions for this user
-                removeEtag(ETag.TYPE_ALL_POSTS);
-                getBus().post(new SyncPostsEvent(false));
+                    // download all posts again to enforce role-based permissions for this user
+                    removeEtag(ETag.TYPE_ALL_POSTS);
+                    getBus().post(new SyncPostsEvent(false));
 
-                refreshSucceeded(event);
+                    refreshSucceeded(event);
+                } else {
+                    // fallback to cached data
+                    RealmResults<User> users = mRealm.where(User.class).findAll();
+                    if (users.size() > 0) {
+                        getBus().post(new UserLoadedEvent(users.first()));
+                    }
+
+                    if (response.code() == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                        refreshSucceeded(event);
+                    } else if (NetworkUtils.isUnauthorized(response)) {
+                        // defer the event and try to re-authorize
+                        refreshAccessToken(event);
+                    } else {
+                        getBus().post(new ApiErrorEvent(error));
+                        refreshFailed(event, error);
+                    }
+                }
             }
 
             @Override
-            public void failure(RetrofitError error) {
-                // fallback to cached data
-                RealmResults<User> users = mRealm.where(User.class).findAll();
-                if (users.size() > 0) {
-                    getBus().post(new UserLoadedEvent(users.first()));
-                }
-                if (NetworkUtils.isUnauthorized(error)) {
-                    // defer the event and try to re-authorize
-                    refreshAccessToken(event);
-                } else if (NetworkUtils.isRealError(error)) {
-                    getBus().post(new ApiErrorEvent(error));
-                    refreshFailed(event, error);
-                } else {
-                    refreshSucceeded(event);
-                }
+            public void onFailure(Call<UserList> call, Throwable error) {
+                // error in transport layer, or lower
+                getBus().post(new ApiErrorEvent(error));
+                refreshFailed(event, error);
             }
         });
     }
@@ -358,32 +367,40 @@ public class NetworkService {
         }
 
         if (! validateAccessToken(event)) return;
-        mApi.getSettings(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_BLOG_SETTINGS), new Callback<SettingsList>() {
+        mApi.getSettings(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_BLOG_SETTINGS)).enqueue(new Callback<SettingsList>() {
             @Override
-            public void success(SettingsList settingsList, Response response) {
-                storeEtag(response.getHeaders(), ETag.TYPE_BLOG_SETTINGS);
-                createOrUpdateModel(settingsList.settings);
-                savePermalinkFormat(settingsList.settings);
-                getBus().post(new BlogSettingsLoadedEvent(settingsList.settings));
-                refreshSucceeded(event);
+            public void onResponse(Call<SettingsList> call, Response<SettingsList> response) {
+                if (response.isSuccessful()) {
+                    SettingsList settingsList = response.body();
+                    storeEtag(response.headers(), ETag.TYPE_BLOG_SETTINGS);
+                    createOrUpdateModel(settingsList.settings);
+                    savePermalinkFormat(settingsList.settings);
+                    getBus().post(new BlogSettingsLoadedEvent(settingsList.settings));
+                    refreshSucceeded(event);
+                } else {
+                    // fallback to cached data
+                    RealmResults<Setting> settings = mRealm.where(Setting.class).findAll();
+                    if (settings.size() > 0) {
+                        getBus().post(new BlogSettingsLoadedEvent(settings));
+                    }
+
+                    if (response.code() == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                        refreshSucceeded(event);
+                    } else if (NetworkUtils.isUnauthorized(response)) {
+                        // defer the event and try to re-authorize
+                        refreshAccessToken(event);
+                    } else {
+                        getBus().post(new ApiErrorEvent(error));
+                        refreshFailed(event, error);
+                    }
+                }
             }
 
             @Override
-            public void failure(RetrofitError error) {
-                // fallback to cached data
-                RealmResults<Setting> settings = mRealm.where(Setting.class).findAll();
-                if (settings.size() > 0) {
-                    getBus().post(new BlogSettingsLoadedEvent(settings));
-                }
-                if (NetworkUtils.isUnauthorized(error)) {
-                    // defer the event and try to re-authorize
-                    refreshAccessToken(event);
-                } else if (NetworkUtils.isRealError(error)) {
-                    getBus().post(new ApiErrorEvent(error));
-                    refreshFailed(event, error);
-                } else {
-                    refreshSucceeded(event);
-                }
+            public void onFailure(Call<SettingsList> call, Throwable error) {
+                // error in transport layer, or lower
+                getBus().post(new ApiErrorEvent(error));
+                refreshFailed(event, error);
             }
         });
     }
@@ -458,76 +475,83 @@ public class NetworkService {
         }
 
         if (! validateAccessToken(event)) return;
-        mApi.getPosts(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_ALL_POSTS), POSTS_FETCH_LIMIT, new Callback<PostList>() {
+        mApi.getPosts(mAuthToken.getAuthHeader(), loadEtag(ETag.TYPE_ALL_POSTS), POSTS_FETCH_LIMIT).enqueue(new Callback<PostList>() {
             @Override
-            public void success(PostList postList, Response response) {
-                storeEtag(response.getHeaders(), ETag.TYPE_ALL_POSTS);
+            public void onResponse(Call<PostList> call, Response<PostList> response) {
+                if (response.isSuccessful()) {
+                    PostList postList = response.body();
+                    storeEtag(response.headers(), ETag.TYPE_ALL_POSTS);
 
-                // if this user is only an author, filter out posts they're not authorized to access
-                // FIXME if the last POSTS_FETCH_LIMIT number of posts are not owned by this author,
-                // FIXME we'll end up with no posts displayed in the UI!
-                RealmResults<User> users = mRealm.where(User.class).findAll();
-                if (users.size() > 0) {
-                    User user = users.first();
-                    if (user.hasOnlyAuthorRole()) {
-                        int currentUser = user.getId();
-                        // reverse iteration because in forward iteration, indices change on deleting
-                        for (int i = postList.posts.size()-1; i >= 0; --i) {
-                            Post post = postList.posts.get(i);
-                            if (post.getAuthor() != currentUser) {
+                    // if this user is only an author, filter out posts they're not authorized to access
+                    // FIXME if the last POSTS_FETCH_LIMIT number of posts are not owned by this author,
+                    // FIXME we'll end up with no posts displayed in the UI!
+                    RealmResults<User> users = mRealm.where(User.class).findAll();
+                    if (users.size() > 0) {
+                        User user = users.first();
+                        if (user.hasOnlyAuthorRole()) {
+                            int currentUser = user.getId();
+                            // reverse iteration because in forward iteration, indices change on deleting
+                            for (int i = postList.posts.size() - 1; i >= 0; --i) {
+                                Post post = postList.posts.get(i);
+                                if (post.getAuthor() != currentUser) {
+                                    postList.posts.remove(i);
+                                }
+                            }
+                        }
+                    }
+
+                    // delete posts that are no longer present on the server
+                    // this assumes that postList.posts is a list of ALL posts on the server
+                    // FIXME time complexity is quadratic in the number of posts!
+                    Observable.from(mRealm.where(Post.class).findAll())
+                            .filter(cached -> postList.indexOf(cached.getUuid()) == -1)
+                            .toList()
+                            .forEach(NetworkService.this::deleteModels);
+
+                    // skip edited posts because they've not yet been uploaded
+                    RealmResults<Post> localOnlyEdits = mRealm.where(Post.class)
+                            .equalTo("pendingActions.type", PendingAction.EDIT_LOCAL)
+                            .or().equalTo("pendingActions.type", PendingAction.EDIT)
+                            .findAll();
+                    for (int i = postList.posts.size() - 1; i >= 0; --i) {
+                        for (int j = 0; j < localOnlyEdits.size(); ++j) {
+                            if (postList.posts.get(i).getUuid().equals(localOnlyEdits.get(j).getUuid())) {
                                 postList.posts.remove(i);
                             }
                         }
                     }
-                }
 
-                // delete posts that are no longer present on the server
-                // this assumes that postList.posts is a list of ALL posts on the server
-                // FIXME time complexity is quadratic in the number of posts!
-                Observable.from(mRealm.where(Post.class).findAll())
-                        .filter(cached -> postList.indexOf(cached.getUuid()) == -1)
-                        .toList()
-                        .forEach(NetworkService.this::deleteModels);
+                    // make sure drafts have a publishedAt of FAR_FUTURE so they're sorted to the top
+                    Observable.from(postList.posts)
+                            .filter(post -> post.getPublishedAt() == null)
+                            .forEach(post -> post.setPublishedAt(DateTimeUtils.FAR_FUTURE));
 
-                // skip edited posts because they've not yet been uploaded
-                RealmResults<Post> localOnlyEdits = mRealm.where(Post.class)
-                        .equalTo("pendingActions.type", PendingAction.EDIT_LOCAL)
-                        .or().equalTo("pendingActions.type", PendingAction.EDIT)
-                        .findAll();
-                for (int i = postList.posts.size()-1; i >= 0; --i) {
-                    for (int j = 0; j < localOnlyEdits.size(); ++j) {
-                        if (postList.posts.get(i).getUuid().equals(localOnlyEdits.get(j).getUuid())) {
-                            postList.posts.remove(i);
-                        }
+                    // now create / update received posts
+                    // TODO use Realm#insertOrUpdate() for faster insertion here: https://realm.io/news/realm-java-1.1.0/
+                    createOrUpdateModel(postList.posts);
+                    getBus().post(new PostsLoadedEvent(getPostsSorted(), POSTS_FETCH_LIMIT));
+
+                    refreshSucceeded(event);
+                } else {
+                    // fallback to cached data
+                    getBus().post(new PostsLoadedEvent(getPostsSorted(), POSTS_FETCH_LIMIT));
+                    if (response.code() == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                        refreshSucceeded(event);
+                    } else if (NetworkUtils.isUnauthorized(response)) {
+                        // defer the event and try to re-authorize
+                        refreshAccessToken(event);
+                    } else {
+                        getBus().post(new ApiErrorEvent(error));
+                        refreshFailed(event, error);
                     }
                 }
-
-                // make sure drafts have a publishedAt of FAR_FUTURE so they're sorted to the top
-                Observable.from(postList.posts)
-                        .filter(post -> post.getPublishedAt() == null)
-                        .forEach(post -> post.setPublishedAt(DateTimeUtils.FAR_FUTURE));
-
-                // now create / update received posts
-                // TODO use Realm#insertOrUpdate() for faster insertion here: https://realm.io/news/realm-java-1.1.0/
-                createOrUpdateModel(postList.posts);
-                getBus().post(new PostsLoadedEvent(getPostsSorted(), POSTS_FETCH_LIMIT));
-
-                refreshSucceeded(event);
             }
 
             @Override
-            public void failure(RetrofitError error) {
-                // fallback to cached data
-                getBus().post(new PostsLoadedEvent(getPostsSorted(), POSTS_FETCH_LIMIT));
-                if (NetworkUtils.isUnauthorized(error)) {
-                    // defer the event and try to re-authorize
-                    refreshAccessToken(event);
-                } else if (NetworkUtils.isRealError(error)) {
-                    getBus().post(new ApiErrorEvent(error));
-                    refreshFailed(event, error);
-                } else {
-                    refreshSucceeded(event);
-                }
+            public void onFailure(Call<PostList> call, Throwable error) {
+                // error in transport layer, or lower
+                getBus().post(new ApiErrorEvent(error));
+                refreshFailed(event, error);
             }
         });
     }
@@ -579,7 +603,7 @@ public class NetworkService {
         List<Post> postsToDelete = new ArrayList<>();
 
         // ugly hack (suggested by the IDE) because this must be declared "final"
-        final RetrofitError[] uploadErrorOccurred = {null};
+        final Response[] uploadError = {null};
 
         final Action0 syncFinishedCB = () -> {
             // delete local copies
@@ -596,15 +620,15 @@ public class NetworkService {
             // if forceNetworkCall is true, first load from the db, AND only then from the network,
             // to avoid a crash because local posts have been deleted above but are still being
             // displayed, so we need to refresh the UI first
-            RetrofitError retrofitError = uploadErrorOccurred[0];
-            if (retrofitError != null && NetworkUtils.isUnauthorized(retrofitError)) {
+            Response response = uploadError[0];
+            if (NetworkUtils.isUnauthorized(response)) {
                 // defer the event and try to re-authorize
                 refreshAccessToken(event);
             } else {
-                if (retrofitError != null && NetworkUtils.isRealError(retrofitError)) {
-                    refreshFailed(event, retrofitError);
-                } else {
+                if (response.code() == HttpURLConnection.HTTP_NOT_MODIFIED) {
                     refreshSucceeded(event);
+                } else {
+                    refreshFailed(event, error);
                 }
                 getBus().post(new PostsLoadedEvent(getPostsSorted(), POSTS_FETCH_LIMIT));
                 if (event.forceNetworkCall) {
@@ -615,10 +639,10 @@ public class NetworkService {
             }
         };
 
-        final Action2<Post, RetrofitError> onFailure = (post, retrofitError) -> {
-            uploadErrorOccurred[0] = retrofitError;
+        final Action2<Post, Response> onFailure = (post, response) -> {
+            uploadError[0] = response;
             mPostUploadQueue.removeFirstOccurrence(post);
-            getBus().post(new ApiErrorEvent(retrofitError));
+            getBus().post(new ApiErrorEvent(response));
             if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
         };
 
@@ -632,17 +656,21 @@ public class NetworkService {
         for (final Post localPost : localDeletedPosts) {
             if (! validateAccessToken(event)) return;
             Crashlytics.log(Log.DEBUG, TAG, "[onSyncPostsEvent] deleting post id = " + localPost.getId());
-            mApi.deletePost(mAuthToken.getAuthHeader(), localPost.getId(), new ResponseCallback() {
+            mApi.deletePost(mAuthToken.getAuthHeader(), localPost.getId()).enqueue(new Callback<String>() {
                 @Override
-                public void success(Response response) {
-                    AnalyticsService.logDraftDeleted();
-                    mPostUploadQueue.removeFirstOccurrence(localPost);
-                    postsToDelete.add(localPost);
-                    if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                public void onResponse(Call<String> call, Response<String> response) {
+                    if (response.isSuccessful()) {
+                        AnalyticsService.logDraftDeleted();
+                        mPostUploadQueue.removeFirstOccurrence(localPost);
+                        postsToDelete.add(localPost);
+                        if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                    } else {
+                        onFailure.call(localPost, response);
+                    }
                 }
 
                 @Override
-                public void failure(RetrofitError error) {
+                public void onFailure(Call<String> call, Throwable error) {
                     onFailure.call(localPost, error);
                 }
             });
@@ -652,20 +680,25 @@ public class NetworkService {
         for (final Post localPost : localNewPosts) {
             if (! validateAccessToken(event)) return;
             Crashlytics.log(Log.DEBUG, TAG, "[onSyncPostsEvent] creating post");    // local new posts don't have an id
-            mApi.createPost(mAuthToken.getAuthHeader(), PostStubList.from(localPost), new Callback<PostList>() {
+            mApi.createPost(mAuthToken.getAuthHeader(), PostStubList.from(localPost)).enqueue(new Callback<PostList>() {
                 @Override
-                public void success(PostList postList, Response response) {
-                    AnalyticsService.logNewDraftUploaded();
-                    createOrUpdateModel(postList.posts);
-                    mPostUploadQueue.removeFirstOccurrence(localPost);
-                    postsToDelete.add(localPost);
-                    // FIXME this is a new post! how do subscribers know which post changed?
-                    getBus().post(new PostReplacedEvent(postList.posts.get(0)));
-                    if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                public void onResponse(Call<PostList> call, Response<PostList> response) {
+                    if (response.isSuccessful()) {
+                        PostList postList = response.body();
+                        AnalyticsService.logNewDraftUploaded();
+                        createOrUpdateModel(postList.posts);
+                        mPostUploadQueue.removeFirstOccurrence(localPost);
+                        postsToDelete.add(localPost);
+                        // FIXME this is a new post! how do subscribers know which post changed?
+                        getBus().post(new PostReplacedEvent(postList.posts.get(0)));
+                        if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                    } else {
+                        onFailure.call(localPost, response);
+                    }
                 }
 
                 @Override
-                public void failure(RetrofitError error) {
+                public void onFailure(Call<PostList> call, Throwable error) {
                     onFailure.call(localPost, error);
                 }
             });
@@ -675,17 +708,22 @@ public class NetworkService {
         Action1<Post> uploadEditedPost = (editedPost) -> {
             Crashlytics.log(Log.DEBUG, TAG, "[onSyncPostsEvent] updating post id = " + editedPost.getId());
             PostStubList postStubList = PostStubList.from(editedPost);
-            mApi.updatePost(mAuthToken.getAuthHeader(), editedPost.getId(), postStubList, new Callback<PostList>() {
+            mApi.updatePost(mAuthToken.getAuthHeader(), editedPost.getId(), postStubList).enqueue(new Callback<PostList>() {
                 @Override
-                public void success(PostList postList, Response response) {
-                    createOrUpdateModel(postList.posts);
-                    mPostUploadQueue.removeFirstOccurrence(editedPost);
-                    getBus().post(new PostSyncedEvent(editedPost.getUuid()));
-                    if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                public void onResponse(Call<PostList> call, Response<PostList> response) {
+                    if (response.isSuccessful()) {
+                        PostList postList = response.body();
+                        createOrUpdateModel(postList.posts);
+                        mPostUploadQueue.removeFirstOccurrence(editedPost);
+                        getBus().post(new PostSyncedEvent(editedPost.getUuid()));
+                        if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                    } else {
+                        onFailure.call(editedPost, response);
+                    }
                 }
 
                 @Override
-                public void failure(RetrofitError error) {
+                public void onFailure(Call<PostList> call, Throwable error) {
                     onFailure.call(editedPost, error);
                 }
             });
@@ -693,35 +731,41 @@ public class NetworkService {
         for (final Post localPost : localEditedPosts) {
             if (! validateAccessToken(event)) return;
             Crashlytics.log(Log.DEBUG, TAG, "[onSyncPostsEvent] downloading edited post with id = " + localPost.getId() + " for comparison");
-            mApi.getPost(mAuthToken.getAuthHeader(), localPost.getId(), new Callback<PostList>() {
+            mApi.getPost(mAuthToken.getAuthHeader(), localPost.getId()).enqueue(new Callback<PostList>() {
                 @Override
-                public void success(PostList postList, Response response) {
-                    Post serverPost = null;
-                    boolean hasConflict = false;
-                    if (!postList.posts.isEmpty()) {
-                        serverPost = postList.posts.get(0);
-                        hasConflict = (serverPost.getUpdatedAt() != null
-                                && !serverPost.getUpdatedAt().equals(localPost.getUpdatedAt()));
-                    }
-                    if (hasConflict && PostUtils.isDirty(serverPost, localPost)) {
-                        Crashlytics.log(Log.WARN, TAG, "[onSyncPostsEvent] conflict found for post id = " + localPost.getId());
-                        mPostUploadQueue.removeFirstOccurrence(localPost);
-                        if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
-                        localPost.setConflictState(Post.CONFLICT_UNRESOLVED);
-                        createOrUpdateModel(localPost);
-                        Crashlytics.log(Log.DEBUG, TAG, "localPost updated at:" + localPost.getUpdatedAt().toString());
-                        Crashlytics.log(Log.DEBUG, TAG, "serverPost updated at: " + serverPost.getUpdatedAt().toString());
-                        Crashlytics.log(Log.DEBUG, TAG, "localPost contents:\n" + localPost.getMarkdown());
-                        Crashlytics.log(Log.DEBUG, TAG, "serverPost contents:\n" + serverPost.getMarkdown());
-                        Crashlytics.logException(new PostConflictFoundException());
-                        getBus().post(new PostConflictFoundEvent(localPost, serverPost));
+                public void onResponse(Call<PostList> call, Response<PostList> response) {
+                    if (response.isSuccessful()) {
+                        PostList postList = response.body();
+                        Post serverPost = null;
+                        boolean hasConflict = false;
+                        if (!postList.posts.isEmpty()) {
+                            serverPost = postList.posts.get(0);
+                            hasConflict = (serverPost.getUpdatedAt() != null
+                                    && !serverPost.getUpdatedAt().equals(localPost.getUpdatedAt()));
+                        }
+                        if (hasConflict && PostUtils.isDirty(serverPost, localPost)) {
+                            Crashlytics.log(Log.WARN, TAG, "[onSyncPostsEvent] conflict found for post id = " + localPost.getId());
+                            mPostUploadQueue.removeFirstOccurrence(localPost);
+                            if (mPostUploadQueue.isEmpty()) syncFinishedCB.call();
+                            localPost.setConflictState(Post.CONFLICT_UNRESOLVED);
+                            createOrUpdateModel(localPost);
+                            Crashlytics.log(Log.DEBUG, TAG, "localPost updated at:" + localPost.getUpdatedAt().toString());
+                            Crashlytics.log(Log.DEBUG, TAG, "serverPost updated at: " + serverPost.getUpdatedAt().toString());
+                            Crashlytics.log(Log.DEBUG, TAG, "localPost contents:\n" + localPost.getMarkdown());
+                            Crashlytics.log(Log.DEBUG, TAG, "serverPost contents:\n" + serverPost.getMarkdown());
+                            Crashlytics.logException(new PostConflictFoundException());
+                            getBus().post(new PostConflictFoundEvent(localPost, serverPost));
+                        } else {
+                            uploadEditedPost.call(localPost);
+                        }
                     } else {
+                        // if we can't get the server post, optimistically upload the local copy
                         uploadEditedPost.call(localPost);
                     }
                 }
 
                 @Override
-                public void failure(RetrofitError error) {
+                public void onFailure(Call<PostList> call, Throwable error) {
                     // if we can't get the server post, optimistically upload the local copy
                     uploadEditedPost.call(localPost);
                 }
@@ -1038,18 +1082,15 @@ public class NetworkService {
     private GhostApiService buildApiService(@NonNull String blogUrl, boolean useApiBaseUrl) {
         String baseUrl = blogUrl;
         if (useApiBaseUrl) {
-            baseUrl = NetworkUtils.makeAbsoluteUrl(blogUrl, "ghost/api/v0.1");
+            baseUrl = NetworkUtils.makeAbsoluteUrl(blogUrl, "ghost/api/v0.1/");
         }
-        RestAdapter.LogLevel logLevel = BuildConfig.DEBUG
-                ? RestAdapter.LogLevel.HEADERS
-                : RestAdapter.LogLevel.NONE;
-        RestAdapter restAdapter = new RestAdapter.Builder()
-                .setEndpoint(baseUrl)
-                .setClient(new OkClient(mOkHttpClient))
-                .setConverter(mGsonConverter)
-                .setLogLevel(logLevel)
+        Retrofit retrofit = new Retrofit.Builder()
+                .baseUrl(baseUrl)
+                .client(mOkHttpClient)
+                .addConverterFactory(mJSONObjectConverterFactory)
+                .addConverterFactory(mGsonConverterFactory)
                 .build();
-        return restAdapter.create(GhostApiService.class);
+        return retrofit.create(GhostApiService.class);
     }
 
     private List<Post> getPostsSorted() {
@@ -1060,10 +1101,10 @@ public class NetworkService {
         return unmanagedPosts;
     }
 
-    private void storeEtag(List<Header> headers, @ETag.Type String etagType) {
-        for (Header header : headers) {
-            if ("ETag".equals(header.getName())) {
-                ETag etag = new ETag(etagType, header.getValue());
+    private void storeEtag(Headers headers, @ETag.Type String etagType) {
+        for (String name : headers.names()) {
+            if ("ETag".equals(name) && !headers.values(name).isEmpty()) {
+                ETag etag = new ETag(etagType, headers.values(name).get(0));
                 createOrUpdateModel(etag);
             }
         }

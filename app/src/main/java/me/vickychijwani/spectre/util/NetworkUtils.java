@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 
 import retrofit.RetrofitError;
 import retrofit.client.Response;
+import retrofit2.Response;
 import rx.Observable;
 import rx.android.schedulers.AndroidSchedulers;
 import rx.schedulers.Schedulers;
@@ -44,24 +45,11 @@ public class NetworkUtils {
         return activeNetworkInfo != null && activeNetworkInfo.isConnected();
     }
 
-    public static boolean isRealError(@NonNull RetrofitError retrofitError) {
-        Response response = retrofitError.getResponse();
-        if (response == null) {
-            // consider this an error, to be safer
-            return true;
-        } else if (response.getStatus() == HttpURLConnection.HTTP_NOT_MODIFIED) {
-            // HTTP 304 is not exactly an error
-            return false;
-        }
-        return true;
-    }
-
-    public static boolean isUnauthorized(@NonNull RetrofitError retrofitError) {
-        Response response = retrofitError.getResponse();
+    public static boolean isUnauthorized(Response response) {
         // Ghost returns 403 Forbidden in some cases, inappropriately
         // see this for what 401 vs 403 should mean: http://stackoverflow.com/a/3297081/504611
-        return response != null && (response.getStatus() == HttpURLConnection.HTTP_UNAUTHORIZED
-                        || response.getStatus() == HttpURLConnection.HTTP_FORBIDDEN);
+        return response.code() == HttpURLConnection.HTTP_UNAUTHORIZED
+                || response.code() == HttpURLConnection.HTTP_FORBIDDEN;
     }
 
     public static String makeAbsoluteUrl(@NonNull String baseUrl, @NonNull String relativePath) {
